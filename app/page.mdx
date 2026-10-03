@@ -1,0 +1,305 @@
+export const metadata = {
+  title: "Test a Go API with Keploy",
+  description:
+    "Record real API traffic from a Gin + Redis app and replay it as tests without writing mocks.",
+}
+
+# Test a Go API with Keploy
+
+This page shows how to test a Go API with Keploy by recording real API traffic and replaying it as automated tests.
+
+The application used in this guide is a sample Gin + Redis OTP application. During recording, Keploy captures the API requests and responses along with the application's interactions with Redis. These recorded interactions are then used as test cases and mocks during replay.
+
+This guide uses the **Docker-based workflow on macOS**.
+
+## How it works
+
+Testing an API that talks to a database usually means writing mocks by manually every application dependencies which you are working with. Keploy removes that step.
+
+When you run `keploy record`, Keploy starts its own agent in a Docker container and attaches your app to that container's network. From there it sees every request your app receives and every call your app makes, here to Redis. HTTP traffic becomes test cases. Redis calls become mocks.
+
+When you run `keploy test`, it replays the recorded requests against your app and answers the app's Redis calls from the mocks. A call with no matching mock is not forwarded to a real Redis, so a missing mock fails the test instead of silently passing.
+
+For a Go developer, that means API tests that reflect how your service really behaves, with no mock code to write or maintain and no database needed to run them.
+
+## Before you begin
+
+### Requirements
+
+You need to have the following tools installed:
+
+- [Go](https://go.dev/dl/)
+- [Docker Desktop](https://www.docker.com/products/docker-desktop/) and Docker Compose
+- Keploy [see the installation guide](https://keploy.io/docs/server/installation/)
+- `curl`
+
+### macOS and Docker
+
+<Callout type="info" title="Use the Docker workflow on macOS">
+  Keploy's quickstart also provides a [Linux/WSL workflow](https://keploy.io/docs/quickstart/samples-redis/#running-app-locally-on-linuxwsl-) that uses eBPF. On macOS, use the Docker-based workflow instead.
+</Callout>
+
+The Docker workflow runs the application inside a container and places it on the Docker network with Redis.
+
+## Setting up the sample application
+
+Clone the sample Go application:
+
+```bash
+git clone https://github.com/keploy/samples-go.git
+```
+
+Move into the Gin + Redis application:
+
+```bash
+cd samples-go/gin-redis
+```
+
+Download the Go dependencies:
+
+```bash
+go mod download
+```
+
+## Update the application
+
+The sample application requires two changes before you build the Docker image.
+
+### Update the Go version
+
+Before building the image, check the Go version required by the application and the version used by the Dockerfile.
+
+The `go.mod` file specifies Go 1.23:
+
+```text
+go 1.23
+```
+
+However, the Dockerfile uses Go 1.20:
+
+```text
+FROM golang:1.20
+```
+
+The Docker image needs to use a Go version that satisfies the version required by `go.mod`. Update the Dockerfile before running `docker build`:
+
+```diff
+- FROM golang:1.20
++ FROM golang:1.23
+```
+
+<Callout type="warning" title="What happens if you skip this">
+  The build will fail at the `go build` step.
+</Callout>
+
+```text
+ > [4/4] RUN go build -o main .:
+0.112 go: errors parsing go.mod:
+0.112 /app/go.mod:3: invalid go version '1.23.0': must match format 1.23
+0.112 /app/go.mod:5: unknown directive: toolchain
+------
+Dockerfile:11
+```
+
+### Update the Redis address
+
+Open `helpers/redis/redisConnect.go` and find this line:
+
+```go
+Addr: "localhost:6379",
+```
+
+Because the application runs inside a Docker container, `localhost` refers to the application container and not the Redis container. With this address the app cannot reach Redis and exits on startup.
+
+Change the Redis address to the Redis container name:
+
+```diff
+- Addr: "localhost:6379",
++ Addr: "myredis:6379",
+```
+
+`myredis` is the Redis container name defined in `docker-compose.yml`.
+
+Docker provides internal DNS resolution between containers on the same network, so the application can reach Redis using `myredis`.
+
+## Start the Redis container
+
+Start the Redis service:
+
+```bash
+docker compose up redis
+```
+
+Leave this command running and open another terminal tab.
+
+In the other terminal, list the Docker networks:
+
+```bash
+docker network ls
+```
+
+Find the network created by Docker Compose. It should look similar to:
+
+```text
+gin-redis_default
+```
+
+The exact network name can be different on your machine. The quickstart writes it as `<networkName>` and never explains it: your app container must join this network to reach Redis.
+
+## Build the application image
+
+After updating the Dockerfile and the Redis address, build the Docker image:
+
+```bash
+docker build -t gin-app:1.0 .
+```
+
+The image is now ready to be used with Keploy.
+
+```text
+[+] Building 28.9s (9/9) FINISHED                                    docker:desktop-linux
+ => [internal] load build definition from Dockerfile                                  0.0s
+ => [internal] load metadata for docker.io/library/golang:1.23                        1.3s
+ => [1/4] FROM docker.io/library/golang:1.23@sha256:60deed95d388...                   0.0s
+ => CACHED [2/4] WORKDIR /app                                                         0.0s
+ => [3/4] COPY . .                                                                    0.0s
+ => [4/4] RUN go build -o main .                                                     20.3s
+ => exporting to image                                                                7.1s
+ => => naming to docker.io/library/gin-app:1.0                                        0.0s
+```
+
+## Record API traffic
+
+Start the application through Keploy:
+
+```bash
+keploy record -c "docker run -p 3001:3001 --network gin-redis_default --name ginRedisApp gin-app:1.0"
+```
+
+Keploy starts the application and records the traffic sent to it. Wait for the application to start before making API requests.
+
+### Generate an OTP
+
+Open another terminal and call the `getVerificationCode` endpoint:
+
+```bash
+curl 'localhost:3001/api/getVerificationCode?email=something@gmail.com&username=lavishpal'
+```
+
+You will see output like this:
+
+```json
+{"status":"true","message":"OTP Generated successfully","otp":"5035"}
+```
+
+The application generates an OTP and stores it in Redis. The OTP is random, so use the one from your own response in the next request.
+
+<Callout type="tip" title="OTP verification fails">
+  The OTP changes on every call. Use the one returned by your own `getVerificationCode` request.
+</Callout>
+
+### Verify the OTP
+
+Send the OTP to the verification endpoint:
+
+```bash
+curl -X POST localhost:3001/api/verifyCode \
+  -H 'Content-Type: application/json' \
+  -d '{"otp": 5035, "email": "something@gmail.com"}'
+```
+
+Replace `5035` with the OTP returned by your previous request. If it matches, you will see output like this:
+
+```json
+{"status":"true","token":"eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...","username":"lavishpal","message":"OTP authenticated successfully"}
+```
+
+After you finish recording the requests, press `Ctrl+C` to shut Keploy down gracefully.
+
+## What Keploy generated
+
+```text
+keploy/
+├── test-set-0/
+│   ├── tests/
+│   │   ├── get-api-getverificationcode-1.yaml   # one test case per request
+│   │   └── post-api-verifycode-1.yaml
+│   ├── mocks.yaml       # recorded DNS and Redis calls
+│   └── mappings.yaml    # which mocks belong to which test
+└── reports/             # results of test runs
+```
+
+The older quickstart shows `test-1.yml` and `mocks.yml`. Use whatever your Keploy version generates (mine was 3.8.57).
+
+## Replay the recorded tests
+
+```bash
+keploy test -c "docker run -p 3001:3001 --rm --network gin-redis_default --name ginRedisApp gin-app:1.0" --delay 10
+```
+
+`--delay 10` makes Keploy wait 10 seconds after starting the app, so the app can boot before the first request arrives.
+
+With the setup so far, the replay can still fail even though recording went fine. Both tests return a 500 and the logs say no mock matched. That means the recording is incomplete: the app asks Redis for SET and GET, and Keploy has no recorded reply for either.
+
+This is the replay output:
+
+```text
+WARN   redis replay: no mock matched for request   {"cmd": "SET", "available_mocks": 2}
+ERROR  redis replay: no mock matched for request (passthrough disabled)
+...
+GET - API - GETVERIFICATIONCODE - 1
+  expected status 200, actual status 500
+  actual body: {"message": "EOF", "status": "false"}
+
+Total tests: 2
+Total test passed: 0
+Total test failed: 2
+```
+
+`available_mocks: 2` is a recording that holds only the Redis handshake, and `passthrough disabled` means Keploy will not fall back to the real Redis. The app turns the missing reply into a 500 with `EOF`.
+
+You can confirm the diagnosis in the recording itself:
+
+```bash
+grep -oiE '\$3\\r\\n(set|get)' keploy/test-set-0/mocks.yaml
+```
+
+A good recording shows both a `set` and a `get`. Mine showed neither.
+
+## Pin the Redis version and record again
+
+`docker-compose.yml` uses `image: redis`, which pulls the newest Redis. With that image, Keploy captured only the handshake. I have not dug into the exact cause. Pinning Redis 7 fixed it.
+
+1. Press `Ctrl+C` in the Redis terminal, then run `docker compose down`.
+2. In `docker-compose.yml`, pin the version:
+
+   ```diff
+   - image: redis
+   + image: redis:7
+   ```
+
+3. Start Redis again with `docker compose up redis`.
+4. Delete the old recording with `rm -rf keploy`.
+5. Run the same `keploy record` command, then repeat both `curl` calls. Use the new OTP from your own response.
+6. Press `Ctrl+C`, and run the `grep` check again. It should now show both `set` and `get`.
+7. Run `keploy test` again:
+
+```bash
+keploy test -c "docker run -p 3001:3001 --rm --network gin-redis_default --name ginRedisApp gin-app:1.0" --delay 10
+```
+
+```text
+Total tests: 2
+Total test passed: 2
+Total test failed: 0
+```
+
+## Make a test fail
+
+In `keploy/test-set-0/tests/get-api-getverificationcode-1.yaml`, change `"status":"true"` to `"status":"false"` in the response body, then run `keploy test` again. One test fails, and Keploy prints the expected and actual response side by side. Change the value back afterwards.
+
+{/* Optional: add a cropped screenshot of the failing diff to /public and uncomment:
+![Keploy diff showing expected status false against actual status true](/failing-diff.png)
+*/}
+
+
