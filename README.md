@@ -2,7 +2,7 @@
 
 A tutorial page, built with Next.js and MDX, on recording and replaying API tests for a Gin + Redis app with [Keploy](https://keploy.io/).
 
-**Live site:** "keploy-go-docs-dacd6ojyx-lavish-s-portfolio.vercel.app"
+**Live site:** "[Link](https://keploy-go-docs-kappa.vercel.app/)"
 
 ## What's inside
 
